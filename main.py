@@ -1,10 +1,11 @@
 import os
 
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException,Response
 from psycopg.rows import dict_row
 
-from schemas import DeviceCreate
+from fastapi import FastAPI, HTTPException, Response
+from schemas import DeviceCreate, EventCreate
 
 app = FastAPI(title="Event Incident Platform")
 
@@ -64,3 +65,47 @@ def get_device(device_id: int) -> dict:
         raise HTTPException(status_code=404, detail="Device not found")
 
     return row
+@app.post("/events", status_code=201)
+def create_event(event: EventCreate, response: Response) -> dict:
+    try:
+        with connect_db() as conn:
+            inserted = conn.execute(
+                """
+                INSERT INTO public.device_events
+                    (event_id, device_id, event_type, occurred_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING event_id, device_id, event_type, occurred_at, received_at
+                """,
+                (event.event_id, event.device_id, event.event_type, event.occurred_at),
+            ).fetchone()
+
+            if inserted is not None:
+                return inserted
+
+            existing = conn.execute(
+                """
+                SELECT event_id, device_id, event_type, occurred_at, received_at
+                FROM public.device_events
+                WHERE event_id = %s
+                """,
+                (event.event_id,),
+            ).fetchone()
+
+            if existing is None:
+                raise RuntimeError("Conflicting event could not be read")
+
+            if (
+                existing["device_id"] != event.device_id
+                or existing["event_type"] != event.event_type
+                or existing["occurred_at"] != event.occurred_at
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Event ID already exists with different data",
+                )
+
+            response.status_code = 200
+            return existing
+    except psycopg.errors.ForeignKeyViolation as exc:
+        raise HTTPException(status_code=404, detail="Device not found") from exc
