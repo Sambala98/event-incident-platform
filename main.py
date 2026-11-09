@@ -81,6 +81,10 @@ def create_event(event: EventCreate, response: Response) -> dict:
             ).fetchone()
 
             if inserted is not None:
+                conn.execute(
+                    "INSERT INTO public.event_outbox (event_id) VALUES (%s)",
+                    (event.event_id,),
+                )
                 return inserted
 
             existing = conn.execute(
