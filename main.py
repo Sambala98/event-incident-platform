@@ -27,15 +27,7 @@ def connect_db():
 
 @app.post("/devices", status_code=201)
 def create_device(device: DeviceCreate) -> dict:
-    with connect(
-        host="127.0.0.1",
-        port=5546,
-        dbname="incident_db",
-        user="incident_app",
-        password=os.environ["POSTGRES_PASSWORD"],
-        connect_timeout=5,
-        row_factory=dict_row,
-    ) as conn:
+    with connect_db() as conn:
         row = conn.execute(
             """
             INSERT INTO public.devices (name, heartbeat_interval_seconds)
