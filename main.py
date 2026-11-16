@@ -6,6 +6,7 @@ from psycopg.rows import dict_row
 
 from fastapi import FastAPI, HTTPException, Response
 from schemas import DeviceCreate, EventCreate,IncidentAcknowledge
+from fastapi.responses import PlainTextResponse
 
 app = FastAPI(title="Event Incident Platform")
 
@@ -177,3 +178,21 @@ def resolve_incident(incident_id: int, request: IncidentAcknowledge) -> dict:
             )
 
     return audit_entry
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics():
+    with connect_db() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS open_count
+            FROM public.incidents
+            WHERE resolved_at IS NULL
+            """
+        ).fetchone()
+
+    return PlainTextResponse(
+        "# HELP incidents_open Current number of open incidents.\n"
+        "# TYPE incidents_open gauge\n"
+        f"incidents_open {row['open_count']}\n",
+        media_type="text/plain; version=0.0.4",
+    )
