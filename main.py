@@ -142,3 +142,38 @@ def acknowledge_incident(incident_id: int, request: IncidentAcknowledge) -> dict
             )
 
     return audit_entry
+
+@app.post("/incidents/{incident_id}/resolve")
+def resolve_incident(incident_id: int, request: IncidentAcknowledge) -> dict:
+    with connect_db() as conn:
+        audit_entry = conn.execute(
+            """
+            WITH resolved AS (
+                UPDATE public.incidents
+                SET resolved_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                  AND resolved_at IS NULL
+                RETURNING id, resolved_at
+            )
+            INSERT INTO public.incident_audit_log
+                (incident_id, action, actor, created_at)
+            SELECT id, 'resolved', %s, resolved_at
+            FROM resolved
+            RETURNING incident_id, action, actor, created_at
+            """,
+            (incident_id, request.actor),
+        ).fetchone()
+
+        if audit_entry is None:
+            incident = conn.execute(
+                "SELECT id FROM public.incidents WHERE id = %s",
+                (incident_id,),
+            ).fetchone()
+            if incident is None:
+                raise HTTPException(status_code=404, detail="Incident not found")
+            raise HTTPException(
+                status_code=409,
+                detail="Incident is already resolved",
+            )
+
+    return audit_entry
