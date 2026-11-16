@@ -110,7 +110,7 @@ def consume_one_event():
                      channel.basic_ack(delivery_tag=delivery.delivery_tag)
                      print(f"Retry limit reached for {event.event_id}. Moved to device.events.dlq.")
                      return
-         
+
     finally:
         connection.close()
 
