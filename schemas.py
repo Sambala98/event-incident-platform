@@ -24,3 +24,8 @@ class EventCreate(BaseModel):
     device_id: int = Field(strict=True, ge=1, le=9_223_372_036_854_775_807)
     event_type: Literal["heartbeat", "fault"]
     occurred_at: AwareDatetime
+
+class IncidentAcknowledge(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    actor: str = Field(min_length=1, max_length=100)

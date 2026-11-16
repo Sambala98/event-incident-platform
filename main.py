@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException,Response
 from psycopg.rows import dict_row
 
 from fastapi import FastAPI, HTTPException, Response
-from schemas import DeviceCreate, EventCreate
+from schemas import DeviceCreate, EventCreate,IncidentAcknowledge
 
 app = FastAPI(title="Event Incident Platform")
 
@@ -105,3 +105,40 @@ def create_event(event: EventCreate, response: Response) -> dict:
             return existing
     except psycopg.errors.ForeignKeyViolation as exc:
         raise HTTPException(status_code=404, detail="Device not found") from exc
+
+@app.post("/incidents/{incident_id}/acknowledge")
+def acknowledge_incident(incident_id: int, request: IncidentAcknowledge) -> dict:
+    with connect_db() as conn:
+        audit_entry = conn.execute(
+            """
+            WITH acknowledged AS (
+                UPDATE public.incidents
+                SET acknowledged_by = %s,
+                    acknowledged_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                  AND resolved_at IS NULL
+                  AND acknowledged_at IS NULL
+                RETURNING id, acknowledged_by, acknowledged_at
+            )
+            INSERT INTO public.incident_audit_log
+                (incident_id, action, actor, created_at)
+            SELECT id, 'acknowledged', acknowledged_by, acknowledged_at
+            FROM acknowledged
+            RETURNING incident_id, action, actor, created_at
+            """,
+            (request.actor, incident_id),
+        ).fetchone()
+
+        if audit_entry is None:
+            incident = conn.execute(
+                "SELECT id FROM public.incidents WHERE id = %s",
+                (incident_id,),
+            ).fetchone()
+            if incident is None:
+                raise HTTPException(status_code=404, detail="Incident not found")
+            raise HTTPException(
+                status_code=409,
+                detail="Incident is already acknowledged or resolved",
+            )
+
+    return audit_entry
