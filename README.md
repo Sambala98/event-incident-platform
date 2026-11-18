@@ -61,11 +61,11 @@ docker compose up -d postgres
 docker compose exec postgres pg_isready -U incident_app -d incident_db
 ```
 
-On an empty database, apply the six migrations in order. Run this as one line
+On an empty database, apply the eight migrations in order. Run this as one line
 and enter the PostgreSQL password if prompted:
 
 ```cmd
-psql -h 127.0.0.1 -p 5546 -U incident_app -d incident_db -v ON_ERROR_STOP=1 --single-transaction -f migrations\001_create_devices.sql -f migrations\002_create_device_events.sql -f migrations\003_create_event_outbox.sql -f migrations\004_create_processed_device_events.sql -f migrations\005_add_device_last_heartbeat_at.sql -f migrations\006_create_incidents.sql
+psql -h 127.0.0.1 -p 5546 -U incident_app -d incident_db -v ON_ERROR_STOP=1 --single-transaction -f migrations\001_create_devices.sql -f migrations\002_create_device_events.sql -f migrations\003_create_event_outbox.sql -f migrations\004_create_processed_device_events.sql -f migrations\005_add_device_last_heartbeat_at.sql -f migrations\006_create_incidents.sql -f migrations\007_add_incident_acknowledgement.sql -f migrations\008_create_incident_audit_log.sql
 ```
 
 Verify the application tables:
@@ -74,8 +74,9 @@ Verify the application tables:
 psql -h 127.0.0.1 -p 5546 -U incident_app -d incident_db -c "\dt public.*"
 ```
 
+
 The table list should include `devices`, `device_events`, `event_outbox`,
-`processed_device_events`, and `incidents`.
+`processed_device_events`, `incidents`, and `incident_audit_log`.
 
 ## Start RabbitMQ and the API
 
@@ -175,3 +176,67 @@ psql -h 127.0.0.1 -p 5546 -U incident_app -d incident_db -c "SELECT id, device_i
 ```
 
 Expect one incident row for the demo device with a timestamp in `resolved_at`.
+
+
+## Monitor open incidents with Prometheus
+
+Keep PostgreSQL and the FastAPI server running. From the project folder,
+start Prometheus the first time with the repository's scrape configuration:
+
+```cmd
+docker run -d --name incident-prometheus -p 127.0.0.1:9090:9090 --mount "type=bind,source=%CD%\prometheus.yml,target=/etc/prometheus/prometheus.yml,readonly" prom/prometheus
+```
+
+If the container already exists and is stopped, run:
+
+```cmd
+docker start incident-prometheus
+```
+
+The configuration tells Prometheus to scrape FastAPI's `/metrics` endpoint
+every 15 seconds. After the first scrape, query the target and metric:
+
+```cmd
+curl.exe -fsS --max-time 5 "http://127.0.0.1:9090/api/v1/query?query=up"
+curl.exe -fsS --max-time 5 "http://127.0.0.1:9090/api/v1/query?query=incidents_open"
+```
+
+For the `event-incident-platform` job, `up` should return a sample value of
+`"1"` after a successful scrape. `incidents_open` is a gauge that reports
+the number of unresolved incidents at scrape time.
+
+- With one unresolved incident, `incidents_open` reports `"1"`.
+- After the last open incident is resolved, `incidents_open` reports `"0"`
+  following a successful scrape.
+
+## View open incidents in Grafana
+
+Keep Prometheus running. For a first-time setup, create a Docker network,
+connect Prometheus to it, and start Grafana:
+
+```cmd
+docker network create incident-monitoring
+docker network connect incident-monitoring incident-prometheus
+docker run -d --name incident-grafana --network incident-monitoring -p 127.0.0.1:3000:3000 -v incident-grafana-data:/var/lib/grafana grafana/grafana
+```
+
+If you already configured Grafana and the container is stopped, run:
+
+```cmd
+docker start incident-grafana
+```
+
+1. Open [Grafana](http://127.0.0.1:3000) and sign in.
+2. Under **Connections → Data sources**, add or edit the **Prometheus** data
+   source. Set its URL to `http://incident-prometheus:9090`, select
+   **No Authentication**, and click **Save & test**.
+3. Under **Dashboards**, open **Import** and upload `grafana-dashboard.json`
+   from the project folder. Select your Prometheus data source if prompted.
+   If the dashboard already exists, open it from the dashboard list.
+4. If the **Open incidents** panel has no data while the Prometheus query
+   returns a sample, edit the panel and select your Prometheus data source.
+   Keep the existing query and set **Options → Type** to **Instant**.
+   Run the query and save the dashboard.
+
+After a successful scrape, refresh the dashboard and compare the **Open
+incidents** value with the `incidents_open` query in the previous section.
