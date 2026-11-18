@@ -16,8 +16,8 @@ flowchart TD
     Consumer --> DLQ[Dead-letter queue]
     Checker[Incident checker] --> DB
     Operators[Operator actions] --> API
-    Prometheus[Prometheus] --> API
-    Grafana[Grafana] --> Prometheus
+    Prometheus[Prometheus] -->|Scrapes /metrics| API
+    Grafana[Grafana] -->|Queries| Prometheus
 ```
 
 1. The API commits each new event and its pending outbox entry in one PostgreSQL transaction.
