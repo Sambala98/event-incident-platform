@@ -1,242 +1,165 @@
 # Event Incident Platform
 
+An event-driven Python backend that monitors device heartbeats and manages incidents from detection through recovery.
 
+Built with **FastAPI, PostgreSQL, RabbitMQ, Docker, Prometheus, and Grafana**. The project explores reliable event delivery, duplicate handling, failure recovery, and auditable state changes.
 
-A Python backend that tracks device heartbeats and opens an incident when a device misses its configured heartbeat interval.
+## Architecture
 
+```mermaid
+flowchart TD
+    API[FastAPI event ingestion] --> DB[(PostgreSQL)]
+    DB --> Publisher[Outbox publisher]
+    Publisher --> RabbitMQ[RabbitMQ]
+    RabbitMQ --> Consumer[Event consumer]
+    Consumer --> DB
+    Consumer --> DLQ[Dead-letter queue]
+    Checker[Incident checker] --> DB
+    Operators[Operator actions] --> API
+    Prometheus[Prometheus] --> API
+    Grafana[Grafana] --> Prometheus
+```
 
+1. The API commits each new event and its pending outbox entry in one PostgreSQL transaction.
+2. The publisher sends pending events to RabbitMQ and records publication after broker confirmation.
+3. The consumer commits event deduplication and heartbeat updates together, then acknowledges the delivery.
+4. The incident checker opens incidents for overdue devices and resolves them after a fresh recovery heartbeat.
+5. Operator actions and automatic resolution produce audit records. Prometheus and Grafana expose the current open-incident count.
 
-## How it works
+## Engineering Decisions
 
+| Concern | Implementation |
+| --- | --- |
+| Database–broker consistency | A transactional outbox preserves publication intent alongside the event |
+| Duplicate API requests | Event UUIDs identify retries. Identical data returns the saved event, while conflicting data returns `409` |
+| Duplicate message delivery | A unique processed-event record prevents repeated database processing |
+| Consumer acknowledgment | RabbitMQ acknowledgment follows a successful database commit |
+| Out-of-order heartbeats | Conditional updates prevent older timestamps from replacing newer heartbeats |
+| Temporary database failures | Connection timeouts receive up to three attempts |
+| Invalid or exhausted messages | Confirmed forwarding to a durable dead-letter queue precedes acknowledgment |
+| Duplicate active incidents | A partial unique index enforces one unresolved incident per device |
+| Audit consistency | Incident state changes and their audit entries share a transaction |
 
+A publisher crash after RabbitMQ confirmation and before the publication timestamp is committed can produce another delivery. Consumer deduplication handles this delivery window through the event UUID.
 
-1. FastAPI saves the device event and its outbox row in one PostgreSQL transaction.
+## Demonstrated Workflows
 
-2. The publisher sends the pending event to RabbitMQ and records publication after broker confirmation.
+### Device outage and recovery
 
-3. The consumer uses the event UUID to skip duplicate deliveries. It records the processed event and updates the heartbeat in one PostgreSQL transaction, then acknowledges the message.
+A heartbeat older than the configured interval causes the checker to open an incident. Repeated checks preserve one active incident. A fresh heartbeat received after the incident opened allows automatic resolution and records `system` as the audit actor.
 
-4. The incident checker opens an incident for an overdue device and resolves it when a heartbeat arrives after the incident opened and is still fresh.
+### Database outage during consumption
 
+With PostgreSQL stopped, the consumer retries connection timeouts three times. After exhaustion, it forwards the event to `device.events.dlq`. Restoring PostgreSQL enables subsequent processing.
 
+Additional manual checks verified:
 
-## Verified scenarios
+- Identical ingestion retries, conflicting UUID reuse, and missing devices.
+- Redelivery after a consumer failure before commit.
+- Duplicate consumption and out-of-order heartbeats.
+- Invalid JSON and invalid event payload forwarding.
+- Operator acknowledgment and resolution, including repeated-action conflicts.
+- Agreement between the API metric, Prometheus, and an imported Grafana dashboard.
 
+## API
 
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `/health` | API health |
+| POST | `/devices` | Register a device |
+| GET | `/devices/{device_id}` | Retrieve a device |
+| POST | `/events` | Ingest heartbeat and fault events |
+| POST | `/incidents/{incident_id}/acknowledge` | Acknowledge an incident |
+| POST | `/incidents/{incident_id}/resolve` | Resolve an incident manually |
+| GET | `/metrics` | Export the open-incident gauge |
 
-- **Missed heartbeat.** Router A exceeded its 30-second interval. The checker opened one incident. A second run opened zero additional incidents.
+Interactive documentation is available at `/docs` while the API is running.
 
-- **Recovery.** A fresh heartbeat went through the API, outbox, RabbitMQ, and consumer. The checker resolved the same incident, and PostgreSQL recorded its `resolved_at` timestamp.
+## Run Locally
 
-
-
-Both scenarios were verified manually. The existing pytest suite passed 12 tests. The publisher, consumer, and incident checker run as separate commands in the local demo.
-
-
-## Local setup on Windows
-
-Prerequisites: Python, Docker Desktop running Linux containers, and `psql` on PATH.
-
-From the project folder, create the virtual environment and install dependencies:
+Development environment uses Windows CMD, Python 3.14.3, PostgreSQL 16, and Docker Desktop with Linux containers. Install `psql` and make it available on PATH.
 
 ```cmd
+git clone https://github.com/Sambala98/event-incident-platform.git
+cd event-incident-platform
 python -m venv .venv
 .venv\Scripts\activate.bat
 python -m pip install -r requirements.txt
 ```
-Create a `.env` file in the project root before starting PostgreSQL. Replace
-the placeholder with a local development password. If you are reusing an
-existing PostgreSQL database, use the password already set for `incident_app`.
+
+Create a project-root `.env` file with a local database password.
 
 ```dotenv
 POSTGRES_PASSWORD=replace_with_your_local_password
 ```
 
-Keep `.env` out of Git.
+For an existing PostgreSQL volume, use its existing password. Keep `.env` excluded from Git.
 
-Start PostgreSQL and check that it is accepting connections:
+Start PostgreSQL.
 
 ```cmd
 docker compose up -d postgres
 docker compose exec postgres pg_isready -U incident_app -d incident_db
 ```
 
-On an empty database, apply the eight migrations in order. Run this as one line
-and enter the PostgreSQL password if prompted:
+Initialize an empty database by applying the migrations in order.
 
 ```cmd
 psql -h 127.0.0.1 -p 5546 -U incident_app -d incident_db -v ON_ERROR_STOP=1 --single-transaction -f migrations\001_create_devices.sql -f migrations\002_create_device_events.sql -f migrations\003_create_event_outbox.sql -f migrations\004_create_processed_device_events.sql -f migrations\005_add_device_last_heartbeat_at.sql -f migrations\006_create_incidents.sql -f migrations\007_add_incident_acknowledgement.sql -f migrations\008_create_incident_audit_log.sql
 ```
 
-Verify the application tables:
-
-```cmd
-psql -h 127.0.0.1 -p 5546 -U incident_app -d incident_db -c "\dt public.*"
-```
-
-
-The table list should include `devices`, `device_events`, `event_outbox`,
-`processed_device_events`, `incidents`, and `incident_audit_log`.
-
-## Start RabbitMQ and the API
-
-Create the local RabbitMQ container on the first run:
+Create RabbitMQ on the first run.
 
 ```cmd
 docker run -d --name incident-rabbitmq -p 127.0.0.1:5672:5672 rabbitmq:4
-```
-
-If the container already exists and is stopped, start it:
-
-```cmd
-docker start incident-rabbitmq
-```
-
-Once the broker has started, verify its AMQP listener:
-
-```cmd
 docker exec incident-rabbitmq rabbitmq-diagnostics -q check_port_listener 5672
 ```
 
-In a CMD window with `.venv` active, start FastAPI:
+For an existing stopped RabbitMQ container, use `docker start incident-rabbitmq`.
+
+Start the API and leave it running.
 
 ```cmd
 python -m uvicorn main:app --reload --host 127.0.0.1 --port 8001 --env-file .env
 ```
 
-Leave Uvicorn running. In a second CMD window, verify the API:
+In another CMD window, enter the project directory and activate `.venv`. Run the processing stages as needed.
 
 ```cmd
-curl.exe -i http://127.0.0.1:8001/health
-```
-
-Expect HTTP `200 OK`. This checks the API endpoint. Use the PostgreSQL
-and RabbitMQ checks above to verify those services separately.
-
-
-## Demo: open and resolve a heartbeat incident
-
-Keep the API, PostgreSQL, and RabbitMQ running. Use a second Windows CMD
-window in the project folder with `.venv` active. For this demo, use an
-empty `device.events` queue and an outbox with no pending events so the
-publisher and consumer pick up the heartbeat you just submitted.
-
-### Open one incident
-
-Create a device with a 30-second heartbeat interval:
-
-```cmd
-curl.exe -i -X POST "http://127.0.0.1:8001/devices" -H "Content-Type: application/json" -d "{\"name\":\"Demo Router\",\"heartbeat_interval_seconds\":30}"
-```
-
-Expect `201 Created`. Set `DEMO_DEVICE_ID` to the returned `id`. For example,
-if the API returns `"id": 4`, run:
-
-```cmd
-set "DEMO_DEVICE_ID=4"
-```
-
-Use a heartbeat from 60 seconds ago to simulate a missed interval:
-
-```cmd
-set "DEMO_HEARTBEAT_AGE=60"
-```
-
-Run this as one line:
-
-```cmd
-python -c "import json, os, uuid; from datetime import datetime, timedelta, timezone; from urllib.request import Request, urlopen; occurred_at = datetime.now(timezone.utc) - timedelta(seconds=int(os.environ['DEMO_HEARTBEAT_AGE'])); event = {'event_id': str(uuid.uuid4()), 'device_id': int(os.environ['DEMO_DEVICE_ID']), 'event_type': 'heartbeat', 'occurred_at': occurred_at.isoformat()}; request = Request('http://127.0.0.1:8001/events', data=json.dumps(event).encode(), headers={'Content-Type': 'application/json'}, method='POST'); response = urlopen(request, timeout=10); print(response.status, response.read().decode())" && python outbox_publisher.py && python event_consumer.py && python incident_checker.py
-```
-
-Expect `201`, the same event UUID in the publisher and consumer output,
-and an incident opened for your demo device. Run the checker again:
-
-```cmd
+python outbox_publisher.py
+python event_consumer.py
 python incident_checker.py
 ```
 
-Expect no additional incident for that device.
+Each publisher invocation handles one pending event. Each consumer invocation handles one message. The checker evaluates devices across the database.
 
-### Resolve the incident
+## Observability
 
-Set the heartbeat age to zero:
+`GET /metrics` exposes `incidents_open`, a gauge backed by the unresolved incident count.
 
-```cmd
-set "DEMO_HEARTBEAT_AGE=0"
-```
+- `prometheus.yml` configures scraping every 15 seconds.
+- `grafana-dashboard.json` contains the exported Open incidents Stat panel.
+- Grafana uses an Instant query for `incidents_open{job="event-incident-platform"}`.
 
-Rerun the same long command from the previous section. It generates a new
-UUID and uses the current UTC time. Expect `Resolved incidents: 1` on an
-isolated demo database when the checker runs within 30 seconds.
-
-Verify the incident in PostgreSQL:
+Verify the API metric with:
 
 ```cmd
-psql -h 127.0.0.1 -p 5546 -U incident_app -d incident_db -c "SELECT id, device_id, opened_at, resolved_at FROM public.incidents WHERE device_id = %DEMO_DEVICE_ID% ORDER BY id;"
+curl.exe -fsS --max-time 10 http://127.0.0.1:8001/metrics
 ```
 
-Expect one incident row for the demo device with a timestamp in `resolved_at`.
-
-
-## Monitor open incidents with Prometheus
-
-Keep PostgreSQL and the FastAPI server running. From the project folder,
-start Prometheus the first time with the repository's scrape configuration:
+## Tests
 
 ```cmd
-docker run -d --name incident-prometheus -p 127.0.0.1:9090:9090 --mount "type=bind,source=%CD%\prometheus.yml,target=/etc/prometheus/prometheus.yml,readonly" prom/prometheus
+python -m pytest -q
 ```
 
-If the container already exists and is stopped, run:
+The latest recorded run passed **12 tests**, primarily covering health and request validation. Delivery failures, retries, incident transitions, and monitoring were verified through manual integration scenarios.
 
-```cmd
-docker start incident-prometheus
-```
+## Current Scope
 
-The configuration tells Prometheus to scrape FastAPI's `/metrics` endpoint
-every 15 seconds. After the first scrape, query the target and metric:
-
-```cmd
-curl.exe -fsS --max-time 5 "http://127.0.0.1:9090/api/v1/query?query=up"
-curl.exe -fsS --max-time 5 "http://127.0.0.1:9090/api/v1/query?query=incidents_open"
-```
-
-For the `event-incident-platform` job, `up` should return a sample value of
-`"1"` after a successful scrape. `incidents_open` is a gauge that reports
-the number of unresolved incidents at scrape time.
-
-- With one unresolved incident, `incidents_open` reports `"1"`.
-- After the last open incident is resolved, `incidents_open` reports `"0"`
-  following a successful scrape.
-
-## View open incidents in Grafana
-
-Keep Prometheus running. For a first-time setup, create a Docker network,
-connect Prometheus to it, and start Grafana:
-
-```cmd
-docker network create incident-monitoring
-docker network connect incident-monitoring incident-prometheus
-docker run -d --name incident-grafana --network incident-monitoring -p 127.0.0.1:3000:3000 -v incident-grafana-data:/var/lib/grafana grafana/grafana
-```
-
-If you already configured Grafana and the container is stopped, run:
-
-```cmd
-docker start incident-grafana
-```
-
-1. Open [Grafana](http://127.0.0.1:3000) and sign in.
-2. Under **Connections → Data sources**, add or edit the **Prometheus** data
-   source. Set its URL to `http://incident-prometheus:9090`, select
-   **No Authentication**, and click **Save & test**.
-3. Under **Dashboards**, open **Import** and upload `grafana-dashboard.json`
-   from the project folder. Select your Prometheus data source if prompted.
-   If the dashboard already exists, open it from the dashboard list.
-4. If the **Open incidents** panel has no data while the Prometheus query
-   returns a sample, edit the panel and select your Prometheus data source.
-   Keep the existing query and set **Options → Type** to **Instant**.
-   Run the query and save the dashboard.
-
-After a successful scrape, refresh the dashboard and compare the **Open
-incidents** value with the `incidents_open` query in the previous section.
+- Workers run through individual commands. Continuous execution and scheduling remain future work.
+- Fault events are ingested and recorded as processed. Incident detection currently uses missed heartbeats.
+- Operator identity comes from the request's `actor` field. Authentication and authorization remain future work.
+- DLQ investigation and replay require operator intervention. A crash during forwarding can produce duplicate DLQ entries.
+- Multiple-worker concurrency and broader automated integration coverage require further testing.
+- Monitoring currently covers the open-incident count.
